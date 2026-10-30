@@ -75,7 +75,16 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     let previous = read_json(&dir.join("report.json"));
     let reuse = (!opts.force).then_some(previous.as_ref()).flatten().filter(|p| p["env"]["cli"] == json!(cli_print));
 
-    println!("DOCX corpus: {} document(s) in {}\n", docs.len(), dir.display());
+    println!("DOCX corpus: {} document(s) in {}", docs.len(), dir.display());
+    match pdftotext_banner() {
+        None => println!("note: poppler's pdftotext is not on PATH — pages will not be compared."),
+        Some(b) => {
+            if let Some(problem) = poppler_problem(&b) {
+                println!("note: {problem}");
+            }
+        }
+    }
+    println!();
     let mut results = Vec::new();
     for doc in &docs {
         let print = match std::fs::read(&doc.path) {
@@ -358,7 +367,7 @@ pub(crate) fn classify(report: &Value, baseline: &Value) -> Vec<String> {
             out.push(format!("{stem}: text no longer survives a docx round trip"));
         }
         if b["word"]["pages_exact"] == json!(true) && d["word"]["pages_exact"] == json!(false) {
-            out.push(format!("{stem}: page count no longer matches Word ({:?} vs {:?})", d["word"]["pages"], b["word"]["pages"]));
+            out.push(format!("{stem}: page count no longer matches Word ({} vs {})", pages_of(d), pages_of(b)));
         }
         let (now, was) = (d["word"]["same_break_pct"].as_f64(), b["word"]["same_break_pct"].as_f64());
         if let (Some(now), Some(was)) = (now, was)
@@ -390,6 +399,13 @@ fn mean(docs: &[&Value], key: &str) -> Value {
     json!((vals.iter().sum::<f64>() / vals.len() as f64 * 10_000.0).round() / 10_000.0)
 }
 
+/// A document's `[Word, ours]` page counts as `Word N → ours M`. Rust's `Debug` for a JSON value
+/// would print `Array [Number(1), Number(2)]`, which is not something to show anyone.
+fn pages_of(doc: &Value) -> String {
+    let n = |i: usize| doc["word"]["pages"].get(i).and_then(Value::as_u64).map_or("?".to_string(), |v| v.to_string());
+    format!("Word {} → ours {}", n(0), n(1))
+}
+
 fn find_doc<'a>(report: &'a Value, stem: &str) -> Option<&'a Value> {
     report["documents"].as_array()?.iter().find(|d| d["stem"] == json!(stem))
 }
@@ -409,6 +425,12 @@ fn one_line(row: &Value) -> String {
     }
     let mut parts = vec![if row["text_roundtrip"] == json!(true) { "text ok".to_string() } else { "TEXT LOST".to_string() }];
     if let Some(w) = row["word"].as_object() {
+        // A comparison that failed is not a fidelity result: saying "pages differ" here would
+        // read as a measurement when nothing was measured.
+        if let Some(e) = w.get("error").and_then(Value::as_str) {
+            parts.push(format!("Word: not compared — {}", e.lines().next().unwrap_or(e)));
+            return parts.join(", ");
+        }
         let pages = if w.get("pages_exact") == Some(&json!(true)) { "pages exact" } else { "pages differ" };
         parts.push(format!("Word: {pages}"));
         if let Some(s) = w.get("same_break_pct").and_then(Value::as_f64) {
@@ -416,6 +438,26 @@ fn one_line(row: &Value) -> String {
         }
     }
     parts.join(", ")
+}
+
+/// Why the `pdftotext` on PATH can't drive a page-by-page comparison, read from its banner.
+///
+/// Git for Windows ships Xpdf's `pdftotext` in `mingw64/bin`, which has no `-bbox-layout` and so
+/// prints its usage instead of a result. Without this the whole usage screen lands in the report
+/// once per document, which reads as a fidelity problem rather than a PATH one.
+/// Poppler is recognised by naming itself, never by the absence of Xpdf: poppler's own banner
+/// credits "Glyph & Cog, LLC" too, so looking for that alone rejects the right tool.
+pub(crate) fn poppler_problem(banner: &str) -> Option<&'static str> {
+    (!banner.contains("Poppler") && !banner.contains("poppler")).then_some(
+        "the `pdftotext` on PATH is not poppler's (Xpdf's has no `-bbox-layout`), so pages cannot be \
+         compared. Git for Windows ships Xpdf's in mingw64/bin — put poppler's bin directory earlier on PATH.",
+    )
+}
+
+/// The banner `pdftotext -v` prints, or None when it isn't on PATH at all.
+fn pdftotext_banner() -> Option<String> {
+    let out = Command::new("pdftotext").arg("-v").output().ok()?;
+    Some(format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout)))
 }
 
 fn summary_lines(s: &Value) -> String {
@@ -619,6 +661,9 @@ mod tests {
         let out = classify(&now, &base);
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(out[0].contains("page count no longer matches Word"), "{out:?}");
+        // Readable numbers, not serde_json's Debug shape.
+        assert!(out[0].contains("Word 10 → ours 11"), "{out:?}");
+        assert!(!out[0].contains("Number("), "{out:?}");
     }
 
     #[test]
@@ -662,6 +707,29 @@ mod tests {
         assert_eq!(o.dpi, 150);
         assert_eq!(o.timeout, Duration::from_secs(120));
         assert!(o.force && !o.maps && !o.save_baseline);
+    }
+
+    #[test]
+    fn xpdfs_pdftotext_is_recognised_and_popplers_is_accepted() {
+        // Both banners are the real output of `pdftotext -v`, not a paraphrase: poppler credits
+        // Glyph & Cog as well, so a check for that string alone rejects poppler itself.
+        let xpdf = "pdftotext version 4.00\nCopyright 1996-2017 Glyph & Cog, LLC";
+        let poppler = "pdftotext version 25.07.0\n\
+                       Copyright 2005-2025 The Poppler Developers - http://poppler.freedesktop.org\n\
+                       Copyright 1996-2011, 2022 Glyph & Cog, LLC";
+        assert!(poppler_problem(xpdf).is_some(), "Xpdf must be rejected");
+        assert!(poppler_problem(poppler).is_none(), "poppler must be accepted despite crediting Glyph & Cog");
+    }
+
+    #[test]
+    fn a_failed_comparison_is_not_reported_as_a_fidelity_result() {
+        let row = json!({"stem": "a", "status": "ok", "text_roundtrip": true, "word": {"error": "pdftotext failed: usage…\nmore"}});
+        let line = one_line(&row);
+        assert!(line.contains("not compared"), "{line}");
+        // "pages differ" would read as a measurement when nothing was measured.
+        assert!(!line.contains("pages differ"), "{line}");
+        // Only the first line of a multi-line tool error reaches the log.
+        assert!(!line.contains("more"), "{line}");
     }
 
     #[test]
