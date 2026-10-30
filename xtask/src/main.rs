@@ -4,6 +4,7 @@
 //! invoked through `std::process::Command`.
 
 mod assets;
+mod docx_corpus;
 mod ico;
 mod layers;
 mod parity;
@@ -29,6 +30,9 @@ commands:
                   (stops at first failure)
   corpus [--download]
                   show where test corpora live; --download fetches PngSuite into corpus/pngsuite
+  corpus docx [--dpi N] [--timeout S] [--maps] [--force] [--save-baseline]
+                  fidelity run over the local DOCX corpus: convert, round-trip and, where a
+                  Word-exported <stem>.ref.pdf sits beside a document, compare page by page
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
   parity          recompute the Word feature-parity summary in docs/parity-checklist.md
   visual-diff <ref.pdf> <test.pdf> <outdir> [--private] [--dpi N]
@@ -48,6 +52,7 @@ fn main() -> ExitCode {
         Some("test") => cmd_test().and_then(|()| cmd_i18n_report()).and_then(|()| cmd_doctest()),
         Some("i18n-report") => cmd_i18n_report(),
         Some("ci") => cmd_ci(),
+        Some("corpus") if rest.first() == Some(&"docx") => docx_corpus::run(rest.get(1..).unwrap_or_default()),
         Some("corpus") => cmd_corpus(rest.contains(&"--download")),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
         Some("parity") => parity::run(&root()),
@@ -257,13 +262,11 @@ fn cmd_corpus(download: bool) -> Result<(), String> {
         "Test corpora live under {} (git-ignored, never committed).
 Tests that use a corpus skip cleanly when it is absent.
 
-  corpus/pngsuite/   PngSuite (public domain) — wordcraft-codecs compares every file
-                     against the `image` crate. Fetch: cargo xtask corpus --download
-  corpus/psd/        PSD samples from MIT/BSD projects (ag-psd, psd-tools test data).
-                     Copy files in manually; licences must be MIT/BSD/CC0.
-  corpus/tiff/       libtiff pics (optional)
-  corpus/exr/        OpenEXR sample images (optional)
-  corpus/raw/        raw.pixls.us samples, CC0 (optional)
+  corpus/docx/       real .docx documents, each with an optional <stem>.ref.pdf exported
+                     from Word. Copy files in manually; they are never committed.
+                     Run: cargo xtask corpus docx
+  corpus/pngsuite/   PngSuite (public domain), for image decoding checks.
+                     Fetch: cargo xtask corpus --download
 ",
         corpus.display()
     );
