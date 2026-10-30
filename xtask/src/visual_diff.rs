@@ -54,7 +54,7 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn compare(reference: &Path, test: &Path, out: &Path, tmp: &Path, dpi: u32, private: bool) -> Result<Value, String> {
+pub(crate) fn compare(reference: &Path, test: &Path, out: &Path, tmp: &Path, dpi: u32, private: bool) -> Result<Value, String> {
     let rp = rasterize(reference, dpi, tmp, "r")?;
     let tp = rasterize(test, dpi, tmp, "t")?;
     let l1 = lines_of(reference)?;
