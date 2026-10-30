@@ -227,6 +227,11 @@ struct RunFail {
 }
 
 /// Run `wordcraft-cli <sub> <args…>`, killing it after `timeout`.
+///
+/// Both pipes are drained by their own thread for as long as the child runs. Waiting on the
+/// child while its output sits unread deadlocks as soon as a pipe buffer fills (~64 KiB), and a
+/// harness built to find hangs must not invent one: that document would be killed by the timeout
+/// and reported as hanging when it was the harness holding it still.
 fn cli_run(cli: &Path, args: &[&std::ffi::OsStr], sub: &str, timeout: Duration) -> Result<Vec<u8>, RunFail> {
     let mut child = Command::new(cli)
         .arg(sub)
@@ -235,31 +240,48 @@ fn cli_run(cli: &Path, args: &[&std::ffi::OsStr], sub: &str, timeout: Duration) 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| RunFail { kind: "harness", detail: format!("{}: {e}", cli.display()) })?;
+    let out_thread = drain(child.stdout.take());
+    let err_thread = drain(child.stderr.take());
+    // Killing the child closes both pipes, so the readers always end and the joins never block.
+    let collect = |t: std::thread::JoinHandle<Vec<u8>>| t.join().unwrap_or_default();
+
     let start = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let out = child.wait_with_output().map_err(|e| RunFail { kind: "harness", detail: e.to_string() })?;
-                if status.success() {
-                    return Ok(out.stdout);
-                }
-                let err = String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>();
-                // A panic escaping the CLI is the never-crash standard's concern, not an
-                // ordinary refusal, so it is recorded under its own name.
-                let kind = if err.contains("panicked at") { "panic" } else { "error" };
-                return Err(RunFail { kind, detail: if err.is_empty() { format!("exited with {status}") } else { err } });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = (collect(out_thread), collect(err_thread));
                     return Err(RunFail { kind: "timeout", detail: format!("killed after {}s", timeout.as_secs()) });
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => return Err(RunFail { kind: "harness", detail: e.to_string() }),
         }
+    };
+    let (stdout, stderr) = (collect(out_thread), collect(err_thread));
+    if status.success() {
+        return Ok(stdout);
     }
+    let err = String::from_utf8_lossy(&stderr).trim().chars().take(300).collect::<String>();
+    // A panic escaping the CLI is the never-crash standard's concern, not an ordinary refusal,
+    // so it is recorded under its own name.
+    let kind = if err.contains("panicked at") { "panic" } else { "error" };
+    Err(RunFail { kind, detail: if err.is_empty() { format!("exited with {status}") } else { err } })
+}
+
+/// Read one of the child's pipes to the end on its own thread, so a full pipe buffer can never
+/// hold the child still while we wait for it.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    })
 }
 
 fn cli_text(cli: &Path, doc: &Path, timeout: Duration) -> Result<String, RunFail> {
