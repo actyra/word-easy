@@ -54,8 +54,21 @@ wasm. Run it before every commit.
   on `PATH`; `corpus docx` also needs `cargo build --release -p wordcraft-cli` first and prints
   setup instructions instead of failing when `corpus/docx/` is absent.
 - `CRAFT_FONTS_DIR` and `CRAFT_I18N_DIR` are **optional** build inputs. Unset, the build warns and
-  continues (English-only interface, no bundled craft fonts) — a plain checkout builds. Only a
-  release sets `CRAFT_I18N_REQUIRED=1`, which turns the missing catalog into an error.
+  continues (English-only interface, no bundled craft fonts). Only a release sets
+  `CRAFT_I18N_REQUIRED=1`, which turns the missing catalog into an error.
+
+### On Windows, a plain checkout does not build
+
+Every item below was hit on a clean Windows machine on 2026-10-30; without them `cargo xtask ci`
+cannot run at all.
+
+| Need | Why |
+|---|---|
+| rustc ≥ 1.95 | `craft-pdf` needs 1.95, `krilla` 1.92. Below that nothing in the workspace compiles. |
+| NASM on `PATH` | `aws-lc-sys` is a C dependency reached through `apps/wordcraft` → `craft-print` → `winprint` → `reqwest`. Because `cargo xtask test` builds `--workspace --bins`, a missing NASM blocks **every** test, not just the desktop app. |
+| `rustup target add wasm32-unknown-unknown` | The `wasm` step. Needs a rustup-managed toolchain: the standalone Rust MSVC installer cannot add targets. |
+| poppler's `pdftotext` **before** Git's on `PATH` | Git for Windows ships Xpdf's in `mingw64/bin`. It has no `-bbox-layout`, so `visual-diff` and `corpus docx` get a usage screen instead of a result. |
+| `CARGO_BUILD_JOBS=8` (or similar) | On a 32-core machine the default parallelism exhausts the Windows commit limit mid-build: `os error 1455` (paging file too small) and rustc dying with `STATUS_STACK_BUFFER_OVERRUN`, which then cascade into nonsense type errors. |
 
 ## Gotchas
 
