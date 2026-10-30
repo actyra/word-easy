@@ -18,13 +18,14 @@ with no argument prints the full list.
 | Task | Command |
 |---|---|
 | Everything, in order, stopping at the first failure | `cargo xtask ci` |
-| Tests (workspace lib/bins/tests, minus the i18n audit) | `cargo xtask test` |
+| Tests, then the interface audit, then doctests | `cargo xtask test` |
 | One test | `cargo test -p <crate> --lib -- --exact <module>::<test>` |
-| Doctests (nextest does not run them) | `cargo test --workspace --doc` |
-| Format / lint | `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` |
+| Doctests alone (nextest does not run them) | `cargo test --workspace --doc` |
+| Format | `cargo fmt --all -- --check` |
+| Lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Wasm check | `cargo xtask wasm` |
 | Asset attribution, crate layering | `cargo xtask assets`, `cargo xtask layers` |
-| Missing-translation report (never fails) | `cargo xtask i18n-report` |
+| Interface audit + missing-translation report | `cargo xtask i18n-report` |
 | Word parity summary → `docs/parity-checklist.md` | `cargo xtask parity` |
 | Test and line counts per crate | `cargo xtask stats [--exact]` |
 | Compare two PDFs page by page (needs poppler) | `cargo xtask visual-diff <ref.pdf> <test.pdf> <outdir>` |
@@ -41,8 +42,9 @@ wasm. Run it before every commit.
   refuses to run and exits 92 (`REQUIRED_VERSION_NOT_MET`) — upgrade rather than work around it.
 - Targets are `--workspace --lib --bins --tests`. Examples are deliberately excluded so they aren't
   linked for a test run; `clippy --all-targets` still compiles them.
-- `cargo xtask test` skips `i18n::audit::untranslated_interface_text` and `cargo xtask i18n-report`
-  runs only that one, uncaptured, so its report reaches the log.
+- `cargo xtask test` is three runs: the suite with
+  `i18n::audit::untranslated_interface_text` filtered out, then that audit on its own and
+  uncaptured so its report reaches the log, then the doctests. Each reuses the first build.
 
 ### Prerequisites
 
@@ -57,9 +59,10 @@ wasm. Run it before every commit.
 - **`egui::ComboBox` is banned** by `clippy.toml` — use `craft_ui::ComboBox`. egui's combo box menu
   can't grow back once open (egui#5225).
 - **Interface text must go through the translation catalog.** `crates/ui-egui/src/i18n/audit.rs`
-  lays the app out in a pseudo-language and reports any visible word not wrapped in `⟦…⟧` marks;
-  untranslated text fails CI.
+  lays the app out in a pseudo-language and reports any visible word not wrapped in `⟦…⟧` marks.
+  Two different outcomes: text that *skips the catalog* fails the audit and so fails CI; a catalog
+  string that some language has *no translation for* is only listed in the report, never a failure.
 - **The control-channel key path on Windows** is `%APPDATA%\WordCraft\control-key.local-<port>`
   (AGENTS.md lists only the Linux and macOS paths). See `docs/control-protocol.md` (Keys).
-- `profile.dev` builds at `opt-level = 1` with dependencies at 2, so a first build is slow but
-  tests run at near-release speed. Give a cold `cargo xtask ci` plenty of time.
+- `profile.dev` builds workspace crates at `opt-level = 1` and dependencies at 2, so a cold
+  `cargo xtask ci` takes a long time. Give it room rather than assuming it hung.
