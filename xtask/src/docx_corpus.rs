@@ -76,7 +76,8 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     let cli_print = fingerprint(&std::fs::read(&cli).map_err(|e| format!("{}: {e}", cli.display()))?);
     let baseline = read_json(&dir.join("baseline.json"));
     let previous = read_json(&dir.join("report.json"));
-    let reuse = (!opts.force).then_some(previous.as_ref()).flatten().filter(|p| p["env"]["cli"] == json!(cli_print));
+    let env = environment(&cli_print, &opts);
+    let reuse = (!opts.force).then_some(previous.as_ref()).flatten().filter(|p| reusable(&p["env"], &env));
 
     println!("DOCX corpus: {} document(s) in {}", docs.len(), dir.display());
     match pdftotext_banner() {
@@ -90,10 +91,10 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     println!();
     let mut results = Vec::new();
     for doc in &docs {
-        let print = match std::fs::read(&doc.path) {
-            Ok(b) => fingerprint(&b),
+        let print = match doc_key(doc) {
+            Ok(k) => k,
             Err(e) => {
-                results.push(failed(&doc.stem, "unreadable", &e.to_string()));
+                results.push(failed(&doc.stem, "unreadable", &e));
                 continue;
             }
         };
@@ -108,7 +109,7 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     }
 
     let report = json!({
-        "env": environment(&cli_print, opts.dpi),
+        "env": env,
         "summary": summarize(&results),
         "documents": results,
     });
@@ -348,18 +349,20 @@ fn cli_binary() -> Result<PathBuf, String> {
 /// Pair each `<stem>.docx` with its `<stem>.ref.pdf` when one is present, in stem order.
 /// `.ref.pdf` files and anything else in the directory are not documents under test.
 pub(crate) fn pair_documents(entries: &[PathBuf]) -> Vec<Doc> {
-    let has_ref = |stem: &str| entries.iter().any(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == format!("{stem}.ref.pdf")));
+    // Case-insensitively, and returning the path that is actually on disk: the document match
+    // below ignores case, Windows' filesystem ignores case, and Word's export casing varies, but
+    // a path built from the document's own stem need not name a file that exists elsewhere.
+    let find_ref = |stem: &str| {
+        let want = format!("{stem}.ref.pdf");
+        entries.iter().find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&want))).cloned()
+    };
     let mut docs: Vec<Doc> = entries
         .iter()
         .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("docx")))
         .filter_map(|p| {
             let stem = p.file_stem()?.to_string_lossy().into_owned();
             // `a.ref.pdf` has stem `a.ref`; a document never does, so this only guards odd names.
-            (!stem.ends_with(".ref")).then(|| Doc {
-                reference: has_ref(&stem).then(|| p.with_file_name(format!("{stem}.ref.pdf"))),
-                stem,
-                path: p.clone(),
-            })
+            (!stem.to_ascii_lowercase().ends_with(".ref")).then(|| Doc { reference: find_ref(&stem), stem, path: p.clone() })
         })
         .collect();
     docs.sort_by(|a, b| a.stem.cmp(&b.stem));
@@ -450,8 +453,11 @@ fn find_doc<'a>(report: &'a Value, stem: &str) -> Option<&'a Value> {
     report["documents"].as_array()?.iter().find(|d| d["stem"] == json!(stem))
 }
 
+/// A document that did not convert. `text_roundtrip` is null rather than false: the round trip
+/// never ran, and recording it as a failed check makes `classify` report one broken document as
+/// both a new failure and a lost-text regression.
 fn failed(stem: &str, kind: &str, detail: &str) -> Value {
-    json!({"stem": stem, "status": kind, "detail": detail, "text_roundtrip": false})
+    json!({"stem": stem, "status": kind, "detail": detail, "text_roundtrip": Value::Null})
 }
 
 fn text_of(v: &Value) -> String {
@@ -526,15 +532,42 @@ fn summary_lines(s: &Value) -> String {
 
 /// What the numbers depend on. Renders use the installed fonts, so two runs only compare
 /// fairly when these agree.
-fn environment(cli_print: &str, dpi: u32) -> Value {
+fn environment(cli_print: &str, opts: &Opts) -> Value {
     json!({
         "commit": git_head(),
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-        "dpi": dpi,
+        "dpi": opts.dpi,
+        "timeout": opts.timeout.as_secs(),
+        "maps": opts.maps,
         "poppler": poppler_version(),
         "craft_fonts": std::env::var_os("CRAFT_FONTS_DIR").is_some(),
         "cli": cli_print,
     })
+}
+
+/// Whether the previous run's rows may be reused at all.
+///
+/// A cached row is a measurement, so its key has to cover every input it was computed from. The
+/// binary that produced it, the resolution it was measured at, the timeout that decided whether a
+/// document hung, and whether maps were written all change the answer, so a run that differs in
+/// any of them starts over. Anything outside this list is recorded for the reader, not compared.
+pub(crate) fn reusable(before: &Value, now: &Value) -> bool {
+    ["cli", "dpi", "timeout", "maps"].iter().all(|k| before[k] == now[k])
+}
+
+/// The key a document's cached row is valid for: its own bytes and its reference's.
+///
+/// Fingerprinting the `.docx` alone would let a Tier B comparison be skipped while the thing it
+/// compares against changed, was added or was deleted — and the reused row carries the old
+/// `word` block forward, so the report states a page count and an SSIM for a comparison that
+/// never ran. Absence is part of the key: "no reference" must not match "a reference".
+fn doc_key(doc: &Doc) -> Result<String, String> {
+    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+    let docx = fingerprint(&read(&doc.path)?);
+    match &doc.reference {
+        Some(r) => Ok(format!("{docx}-{}", fingerprint(&read(r)?))),
+        None => Ok(format!("{docx}-none")),
+    }
 }
 
 fn git_head() -> Value {
@@ -569,7 +602,9 @@ fn parse_opts(args: &[&str]) -> Result<Opts, String> {
             None => Ok(None),
         }
     };
-    for a in args.iter().filter(|a| a.starts_with("--")) {
+    // Any leading dash, not just two: `-force` is a typo, and silently treating it as a
+    // positional argument turns an explicit instruction into a no-op.
+    for a in args.iter().filter(|a| a.starts_with('-')) {
         if !["--dpi", "--timeout", "--maps", "--force", "--save-baseline"].contains(a) {
             return Err(format!("unknown option `{a}`"));
         }
@@ -715,6 +750,17 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_document_is_not_also_reported_as_having_lost_its_text() {
+        // Built by the production `failed()`, not a hand-made fixture: the point is what a real
+        // failure row looks like. A convert that timed out never reached the round-trip check,
+        // so claiming the text stopped surviving one asserts a measurement that never happened.
+        let base = json!({"documents": [doc_row("a", "ok", true, None, 0.0)]});
+        let now = json!({"documents": [failed("a", "timeout", "killed after 120s")]});
+        let out = classify(&now, &base);
+        assert_eq!(out.len(), 1, "one failure must be reported once: {out:?}");
+    }
+
+    #[test]
     fn lost_text_in_a_round_trip_is_a_regression() {
         let base = json!({"documents": [doc_row("a", "ok", true, None, 0.0)]});
         let now = json!({"documents": [doc_row("a", "ok", false, None, 0.0)]});
@@ -782,6 +828,65 @@ mod tests {
         assert!(run_failed(1, 0, false));
         assert!(run_failed(0, 1, false));
         assert!(!run_failed(0, 0, false));
+    }
+
+    #[test]
+    fn rows_are_reused_only_when_every_input_they_were_measured_with_is_unchanged() {
+        let env = |cli: &str, dpi: u32, timeout: u64, maps: bool| {
+            json!({
+                "cli": cli, "dpi": dpi, "timeout": timeout, "maps": maps,
+                // Recorded for the reader, never compared: a new commit with the same binary
+                // measures the same thing.
+                "commit": "abc", "os": "windows x86_64", "poppler": "25.07.0", "craft_fonts": false,
+            })
+        };
+        let now = env("aaaa", 100, 120, false);
+        assert!(reusable(&env("aaaa", 100, 120, false), &now));
+        assert!(reusable(&json!({"cli": "aaaa", "dpi": 100, "timeout": 120, "maps": false, "commit": "zzz"}), &now));
+        assert!(!reusable(&env("bbbb", 100, 120, false), &now), "a different CLI binary");
+        assert!(!reusable(&env("aaaa", 150, 120, false), &now), "a different dpi");
+        assert!(!reusable(&env("aaaa", 100, 600, false), &now), "a different timeout");
+        assert!(!reusable(&env("aaaa", 100, 120, true), &now), "maps changed");
+    }
+
+    #[test]
+    fn a_documents_key_covers_its_reference() {
+        let dir = std::env::temp_dir().join(format!("wc-corpus-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (docx, r) = (dir.join("a.docx"), dir.join("a.ref.pdf"));
+        std::fs::write(&docx, b"document").expect("write docx");
+        let alone = Doc { stem: "a".into(), path: docx.clone(), reference: None };
+        let bare = doc_key(&alone).expect("key without a reference");
+
+        std::fs::write(&r, b"reference one").expect("write ref");
+        let with = Doc { stem: "a".into(), path: docx.clone(), reference: Some(r.clone()) };
+        let one = doc_key(&with).expect("key with a reference");
+        // Adding a reference must invalidate the cached row, or Tier B never runs on it.
+        assert_ne!(bare, one, "adding a reference left the key unchanged");
+
+        std::fs::write(&r, b"reference two, re-exported").expect("rewrite ref");
+        let two = doc_key(&with).expect("key with the new reference");
+        // Replacing it must too, or the old page count and SSIM are reported as current.
+        assert_ne!(one, two, "replacing the reference left the key unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_dash_typo_is_rejected_rather_than_silently_ignored() {
+        // `-force` is not `--force`: the validator only inspects arguments starting with `--`,
+        // so a typo becomes a no-op and the operator believes the run was forced.
+        assert!(parse_opts(&["-force"]).is_err(), "-force must not be accepted silently");
+    }
+
+    #[test]
+    fn a_reference_is_found_whatever_its_case() {
+        // The document match is `eq_ignore_ascii_case`, so `A.DOCX` is a document; the reference
+        // match is an exact string compare, so its casing has to agree. On Windows the
+        // filesystem does not care, and Word's export casing varies.
+        let docs = pair_documents(&paths(&["A.DOCX", "A.Ref.pdf"]));
+        assert_eq!(docs.len(), 1);
+        assert!(docs[0].reference.is_some(), "the reference beside A.DOCX was not paired");
     }
 
     #[test]
