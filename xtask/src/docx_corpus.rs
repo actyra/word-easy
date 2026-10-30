@@ -26,8 +26,11 @@
 //!   matches Word exactly.
 //!
 //! Nothing here reports a failure merely because a document differs from Word — every document
-//! does. The exit status is non-zero only for a harness error, a document that newly fails
-//! outright, or a regression against the saved baseline.
+//! does. The exit status is non-zero only for a harness error, a document that fails outright
+//! where the baseline does not already record it failing the same way, or a regression against
+//! that baseline. A real corpus keeps permanent failures (Word 6/95 files are refused by design),
+//! so a run that fails on every broken document would be red for good; `--save-baseline` records
+//! today's failures as known and exits 0.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -114,11 +117,11 @@ pub fn run(args: &[&str]) -> Result<(), String> {
         write_json(&dir.join("baseline.json"), &report)?;
         println!("\nbaseline saved");
     }
-    finish(&report, baseline.as_ref(), &dir)
+    finish(&report, baseline.as_ref(), &dir, opts.save_baseline)
 }
 
 /// Print the run, then the regressions, and fail only on a hard problem.
-fn finish(report: &Value, baseline: Option<&Value>, dir: &Path) -> Result<(), String> {
+fn finish(report: &Value, baseline: Option<&Value>, dir: &Path, saving_baseline: bool) -> Result<(), String> {
     println!("\n{}", summary_lines(&report["summary"]));
     println!("report: {}", dir.join("report.json").display());
 
@@ -141,10 +144,40 @@ fn finish(report: &Value, baseline: Option<&Value>, dir: &Path) -> Result<(), St
     } else if baseline.is_some() {
         println!("\nno regressions against baseline.json");
     }
-    if !broken.is_empty() || !regressions.is_empty() {
-        return Err(format!("{} failing document(s), {} regression(s)", broken.len(), regressions.len()));
+    let fresh = new_failures(report, baseline);
+    if !fresh.is_empty() {
+        println!("\n{} document(s) newly failing:", fresh.len());
+        for f in &fresh {
+            println!("  {f}");
+        }
+    }
+    if run_failed(fresh.len(), regressions.len(), saving_baseline) {
+        return Err(format!("{} newly failing, {} regression(s)", fresh.len(), regressions.len()));
     }
     Ok(())
+}
+
+/// Whether the run should fail. Saving a baseline declares this run to be the new truth, so it
+/// fails only on a harness error, which has already returned before this is reached.
+pub(crate) fn run_failed(fresh: usize, regressions: usize, saving_baseline: bool) -> bool {
+    !saving_baseline && (fresh > 0 || regressions > 0)
+}
+
+/// Documents failing now that the baseline does not already record failing the same way.
+///
+/// A corpus of real documents keeps some permanent failures — Word 6/95 files are refused by
+/// design — so failing on every broken document would leave the gate red for good and make the
+/// baseline pointless. Without a baseline there is nothing to excuse them, so every failure is new.
+pub(crate) fn new_failures(report: &Value, baseline: Option<&Value>) -> Vec<String> {
+    let Some(docs) = report["documents"].as_array() else { return Vec::new() };
+    docs.iter()
+        .filter(|d| d["status"] != json!("ok"))
+        .filter(|d| {
+            let known = baseline.and_then(|b| find_doc(b, &text_of(&d["stem"]))).is_some_and(|b| b["status"] == d["status"]);
+            !known
+        })
+        .map(|d| format!("{}: {} — {}", text_of(&d["stem"]), text_of(&d["status"]), text_of(&d["detail"])))
+        .collect()
 }
 
 // -------------------------------------------------------------------------------------------
@@ -365,6 +398,13 @@ pub(crate) fn classify(report: &Value, baseline: &Value) -> Vec<String> {
         }
         if b["text_roundtrip"] == json!(true) && d["text_roundtrip"] == json!(false) {
             out.push(format!("{stem}: text no longer survives a docx round trip"));
+        }
+        // A comparison that used to happen and now doesn't is a loss, not a clean slate: every
+        // numeric rule below reads null and finds nothing to complain about, so without this a
+        // poppler that stopped working would be reported as no regressions at all.
+        if b["word"]["pages_exact"].is_boolean() && !d["word"]["pages_exact"].is_boolean() {
+            let why = d["word"]["error"].as_str().map_or("no reference".to_string(), |e| e.lines().next().unwrap_or(e).to_string());
+            out.push(format!("{stem}: no longer compared with Word — {why}"));
         }
         if b["word"]["pages_exact"] == json!(true) && d["word"]["pages_exact"] == json!(false) {
             out.push(format!("{stem}: page count no longer matches Word ({} vs {})", pages_of(d), pages_of(b)));
@@ -696,6 +736,52 @@ mod tests {
         let base = json!({"documents": []});
         let now = json!({"documents": [doc_row("new", "error", false, None, 0.0)]});
         assert!(classify(&now, &base).is_empty());
+    }
+
+    #[test]
+    fn a_failure_the_baseline_already_records_is_not_a_new_failure() {
+        // A real corpus keeps permanent failures: Word 6/95 files are refused by design. If
+        // those failed the run, the gate would be red for good and the baseline would do nothing.
+        let base = json!({"documents": [doc_row("old95", "error", false, None, 0.0)]});
+        let now = json!({"documents": [doc_row("old95", "error", false, None, 0.0)]});
+        assert!(new_failures(&now, Some(&base)).is_empty());
+    }
+
+    #[test]
+    fn a_failure_that_is_new_or_has_changed_kind_counts() {
+        let base = json!({"documents": [doc_row("a", "error", false, None, 0.0)]});
+        // Same document, worse outcome: an error that became a panic is news.
+        let worse = json!({"documents": [doc_row("a", "panic", false, None, 0.0)]});
+        assert_eq!(new_failures(&worse, Some(&base)).len(), 1);
+        // A document the baseline has never seen.
+        let fresh = json!({"documents": [doc_row("b", "timeout", false, None, 0.0)]});
+        assert_eq!(new_failures(&fresh, Some(&base)).len(), 1);
+        // With no baseline nothing is excused.
+        assert_eq!(new_failures(&base, None).len(), 1);
+    }
+
+    #[test]
+    fn a_comparison_that_stopped_happening_is_a_regression() {
+        // Every numeric rule reads null here and finds nothing wrong, so without an explicit
+        // rule a poppler that stopped working would be reported as a clean run.
+        let base = json!({"documents": [doc_row("a", "ok", true, Some((9, 9)), 98.0)]});
+        let mut gone = json!({"documents": [doc_row("a", "ok", true, None, 0.0)]});
+        gone["documents"][0]["word"] = json!({"error": "pdftotext failed: usage…\nrest"});
+        let out = classify(&gone, &base);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("no longer compared with Word"), "{out:?}");
+        assert!(!out[0].contains("rest"), "only the tool's first error line: {out:?}");
+    }
+
+    #[test]
+    fn saving_a_baseline_records_todays_failures_rather_than_failing_on_them() {
+        // Recording a baseline is how permanent failures become known, so it cannot be the
+        // thing that fails; otherwise a corpus with one bad document could never get a baseline.
+        assert!(!run_failed(3, 2, true));
+        // Without it, either count fails the run, and a clean run passes.
+        assert!(run_failed(1, 0, false));
+        assert!(run_failed(0, 1, false));
+        assert!(!run_failed(0, 0, false));
     }
 
     #[test]
