@@ -146,10 +146,19 @@ pub fn find_in(dir: &Path, names: &[&str]) -> Option<(PathBuf, PathBuf)> {
 pub(crate) fn read_capped(p: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let err = |e: std::io::Error| format!("{}: {e}", p.display());
-    let f = std::fs::File::open(p).map_err(err)?;
+    let not_regular = || format!("{}: not a regular file", p.display());
+    let f = match std::fs::File::open(p) {
+        Ok(f) => f,
+        // Unix opens a directory and the metadata check below refuses it; Windows refuses to
+        // open one at all, with "Access is denied", which says nothing about what is wrong.
+        // Both report the same thing. The file is still opened before it is stated, so the
+        // handle that is read is the one that was checked.
+        Err(_) if p.is_dir() => return Err(not_regular()),
+        Err(e) => return Err(err(e)),
+    };
     let meta = f.metadata().map_err(err)?;
     if !meta.is_file() {
-        return Err(format!("{}: not a regular file", p.display()));
+        return Err(not_regular());
     }
     if meta.len() > MAX_FILE {
         return Err(format!("{}: too large ({} bytes)", p.display(), meta.len()));
