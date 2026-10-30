@@ -27,6 +27,7 @@ with no argument prints the full list.
 | Asset attribution, crate layering | `cargo xtask assets`, `cargo xtask layers` |
 | Interface audit + missing-translation report | `cargo xtask i18n-report` |
 | Word parity summary → `docs/parity-checklist.md` | `cargo xtask parity` |
+| DOCX fidelity run over the local corpus | `cargo xtask corpus docx [--save-baseline]` |
 | Test and line counts per crate | `cargo xtask stats [--exact]` |
 | Compare two PDFs page by page (needs poppler) | `cargo xtask visual-diff <ref.pdf> <test.pdf> <outdir>` |
 | Run the app with the control channel | `cargo run --release -p wordcraft -- --sample --control 7981` |
@@ -49,7 +50,9 @@ wasm. Run it before every commit.
 ### Prerequisites
 
 - `cargo xtask wasm` needs the target: `rustup target add wasm32-unknown-unknown`.
-- `cargo xtask visual-diff` needs poppler (`pdftoppm`, `pdftotext`) on `PATH`.
+- `cargo xtask visual-diff` and `cargo xtask corpus docx` need poppler (`pdftoppm`, `pdftotext`)
+  on `PATH`; `corpus docx` also needs `cargo build --release -p wordcraft-cli` first and prints
+  setup instructions instead of failing when `corpus/docx/` is absent.
 - `CRAFT_FONTS_DIR` and `CRAFT_I18N_DIR` are **optional** build inputs. Unset, the build warns and
   continues (English-only interface, no bundled craft fonts) — a plain checkout builds. Only a
   release sets `CRAFT_I18N_REQUIRED=1`, which turns the missing catalog into an error.

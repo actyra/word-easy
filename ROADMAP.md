@@ -140,6 +140,8 @@ Ranked, to beta (detail and remaining milestones in [docs/roadmap.md](docs/roadm
 
 ## Progress log
 
+- 2026-10-30: `cargo xtask corpus docx` runs a DOCX fidelity batch over a local, gitignored corpus: each document is converted, round-tripped docx to docx with a text check, and -- where a Word-exported `<stem>.ref.pdf` sits beside it -- compared with Word page by page through the existing visual-diff code. Conversions run under a timeout and a failure, panic or hang is recorded while the batch continues. Private by default (no text, no page images), resumable, and non-zero only for a harness error, a new outright failure or a regression against a saved baseline. This narrows gap 1 from "never tested" to "no corpus assembled": real documents had been checked by hand (229/251 exact page counts, 2026-10-17) but not reproducibly. 13 hermetic xtask tests, each verified by mutation. No corpus is committed and no fidelity number changes.
+
 - 2026-10-28: Convert Notes walks reference offsets and formatting runs together instead of rescanning all references for every run (#4750). Note text, IDs, custom marks, styles, history and saved content retain their behavior. Synthetic scaling, CLI/MCP and native/DOCX reopen coverage; readiness estimates unchanged.
 
 - 2026-10-29: Saving a DOCX with many comments no longer searches all comment paragraph IDs and all reserved durable IDs for each comment. Paragraph IDs use their existing sorted order; durable-ID reservations are indexed once. Parent links, resolved flags, authored text and existing ID rules are unchanged.
